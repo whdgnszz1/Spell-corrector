@@ -1,1 +1,1 @@
-# Spell-coorector
+# Spell-corrector
