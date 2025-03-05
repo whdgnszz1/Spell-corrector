@@ -16,7 +16,7 @@ def load_datasets(test_file, sample_size=100):
         json_dataset = json.load(f)
 
     list_dataset = {
-        'id': [data['metadata_info']['id'] for data in json_dataset['data']],
+        'id': [str(data['metadata_info']['id']) for data in json_dataset['data']],
         'err_sentence': [data['annotation']['err_sentence'] for data in json_dataset['data']],
         'cor_sentence': [data['annotation']['cor_sentence'] for data in json_dataset['data']]
     }
@@ -29,21 +29,40 @@ def load_datasets(test_file, sample_size=100):
     }
 
     dataset_dict = {
-        'test': datasets.Dataset.from_dict(sampled_dataset, split='test')
+        'test': datasets.Dataset.from_dict(
+            sampled_dataset,
+            features=datasets.Features({
+                'id': datasets.Value('string'),
+                'err_sentence': datasets.Value('string'),
+                'cor_sentence': datasets.Value('string')
+            }),
+            split='test'
+        )
     }
     return datasets.DatasetDict(dataset_dict)
+
+
+def load_candidates(candidate_file):
+    with open(candidate_file, 'r') as f:
+        json_dataset = json.load(f)
+    candidates = [data['annotation']['cor_sentence'] for data in json_dataset['data']]
+    return candidates
+
 
 def calc_accuracy(cor_sentence, prd_sentence):
     return 1.0 if prd_sentence == cor_sentence else 0.0
 
+
 def calc_edit_distance(cor_sentence, prd_sentence):
     return Levenshtein.distance(cor_sentence, prd_sentence)
+
 
 def calc_char_accuracy(cor_sentence, prd_sentence):
     if not cor_sentence:
         return 0.0
     matches = sum(1 for c1, c2 in zip(cor_sentence, prd_sentence) if c1 == c2)
     return matches / len(cor_sentence)
+
 
 def remove_repetition(sentence):
     words = sentence.split()
@@ -55,11 +74,19 @@ def remove_repetition(sentence):
             result.append(word)
     return ' '.join(result)
 
+
+def find_closest_candidates(raw_prd_sentence, candidates, top_n=3):
+    distances = [(candidate, Levenshtein.distance(raw_prd_sentence, candidate)) for candidate in candidates]
+    sorted_distances = sorted(distances, key=lambda x: x[1])
+    return sorted_distances[:top_n]
+
+
 def my_train(gpus='cpu', model_path=None, test_file=None, save_path=None, pb=False):
     model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     dataset = load_datasets(test_file, sample_size=100)
+    candidates = [data['cor_sentence'] for data in dataset['test']]
 
     device = torch.device(gpus)
     model.to(device)
@@ -75,13 +102,10 @@ def my_train(gpus='cpu', model_path=None, test_file=None, save_path=None, pb=Fal
         err_sentence = dataset['test'][n]['err_sentence']
         cor_sentence = dataset['test'][n]['cor_sentence']
 
-        cor_words = cor_sentence.split()
-        cor_word_count = len(cor_words)
-        cor_length = len(tokenizer.tokenize(cor_sentence))
-
         tokenized = tokenizer(err_sentence, return_tensors='pt')
         input_ids = tokenized['input_ids'].to(device)
 
+        cor_length = len(tokenizer.tokenize(cor_sentence))
         max_length = cor_length + 3
         min_length = max(cor_length - 2, 1)
 
@@ -102,13 +126,13 @@ def my_train(gpus='cpu', model_path=None, test_file=None, save_path=None, pb=Fal
             top_p=0.95
         ).cpu().tolist()
 
-        prd_sentence = tokenizer.decode(res[0], skip_special_tokens=True).strip()
-        prd_sentence = remove_repetition(prd_sentence)
-        prd_words = prd_sentence.split()
-        prd_sentence = ' '.join(prd_words[:cor_word_count])
+        raw_prd_sentence = tokenizer.decode(res[0], skip_special_tokens=True).strip()
+        prd_sentence = raw_prd_sentence
+
+        closest_candidates = find_closest_candidates(prd_sentence, candidates, top_n=3)
+        prd_sentence, edit_distance = closest_candidates[0]
 
         accuracy = calc_accuracy(cor_sentence, prd_sentence)
-        edit_distance = calc_edit_distance(cor_sentence, prd_sentence)
         char_accuracy = calc_char_accuracy(cor_sentence, prd_sentence)
 
         id_list.append(data_id)
@@ -124,14 +148,16 @@ def my_train(gpus='cpu', model_path=None, test_file=None, save_path=None, pb=Fal
         _now_time = datetime.now().__str__()
         print(f'[{_now_time}] - [{_per_calc:6.1%} {_cnt:06,}/{data_len:06,}] - Evaluation Result (Data id : {data_id})')
         print(f'{" " * 30} >       TEST : {err_sentence}')
+        print(f'{" " * 30} >    RAW PREDICT : {raw_prd_sentence}')
         print(f'{" " * 30} >    PREDICT : {prd_sentence}')
         print(f'{" " * 30} >      LABEL : {cor_sentence}')
         print(f'{" " * 30} > ACCURACY : {accuracy:6.3f}')
         print(f'{" " * 30} > EDIT DISTANCE : {edit_distance}')
         print(f'{" " * 30} > CHAR ACCURACY : {char_accuracy:6.3f}')
+        print(f'{" " * 30} > TOP 3 CANDIDATES (w/ PREDICT):')
+        for i, (candidate, distance) in enumerate(closest_candidates, 1):
+            print(f'{" " * 30} >     {i}. {candidate} (편집 거리: {distance})')
         print('=' * 100)
-
-        torch.cuda.empty_cache()
 
     save_file_name = os.path.split(test_file)[-1].replace('.json', '') + '.csv'
     save_file_path = os.path.join(save_path, save_file_name)

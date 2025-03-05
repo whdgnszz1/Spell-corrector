@@ -4,6 +4,9 @@
 code/venv
 code/data
 code/result
+code/incorrect_cases.json
 
 datasets
 models
+
+sym_spell/venv
