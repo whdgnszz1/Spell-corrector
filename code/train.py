@@ -10,7 +10,6 @@ from omegaconf import OmegaConf
 from datasets import Dataset, DatasetDict, Features, Value
 import torch
 import torch.nn.functional as F
-import random
 from torch.utils.data import WeightedRandomSampler, DataLoader
 import Levenshtein
 
@@ -18,7 +17,7 @@ INCORRECT_CASES_FILE = 'incorrect_cases.json'
 
 
 def load_candidates(candidate_file):
-    with open(candidate_file, 'r') as f:
+    with open(candidate_file, 'r', encoding='utf-8') as f:
         json_dataset = json.load(f)
     candidates = [data['annotation']['cor_sentence'] for data in json_dataset['data']]
     return candidates
@@ -174,17 +173,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
             weights=weights,
             full_eval_dataset=self.full_eval_dataset,
-            candidate_file='../datasets/dataset_train_case3.json',
+            candidate_file=config.candidate_data_path_list[0],
             is_reinforce=True
         )
         reinforced_trainer.train()
 
 
-def make_dataset(train_data_path_list, test_data_path_list):
+def make_dataset(train_data_path_list, validation_data_path_list):
     loaded_data_dict = {
         'train': {'err_sentence': [], 'cor_sentence': [], 'case': [], 'score': [], 'weight': []},
         'validation': {'err_sentence': [], 'cor_sentence': [], 'case': []},
-        'test': {'err_sentence': [], 'cor_sentence': [], 'case': []}
     }
 
     for i, train_data_path in enumerate(train_data_path_list):
@@ -202,36 +200,26 @@ def make_dataset(train_data_path_list, test_data_path_list):
                 loaded_data_dict['train']['weight'].append(1.0)
         print(f'train data {i} :', len(_temp_json['data']))
 
-    test_data = []
-    for i, test_data_path in enumerate(test_data_path_list):
-        with open(test_data_path, 'r') as f:
+    validation_data = []
+    for i, validation_data_path in enumerate(validation_data_path_list):
+        with open(validation_data_path, 'r') as f:
             _temp_json = json.load(f)
         for x in _temp_json['data']:
             err = x['annotation'].get('err_sentence', '')
             cor = x['annotation'].get('cor_sentence', '')
             case = str(x['annotation'].get('case', ''))
             if err and cor and case in ['1', '2', '3']:
-                test_data.append({
+                validation_data.append({
                     'err_sentence': err,
                     'cor_sentence': cor,
                     'case': case
                 })
-        print(f'test data {i} :', len(_temp_json['data']))
+        print(f'validation data {i} :', len(_temp_json['data']))
 
-    random.shuffle(test_data)
-    val_size = int(len(test_data) * 0.1)
-    val_data = test_data[:val_size]
-    test_data = test_data[val_size:]
-
-    for item in val_data:
+    for item in validation_data:
         loaded_data_dict['validation']['err_sentence'].append(item['err_sentence'])
         loaded_data_dict['validation']['cor_sentence'].append(item['cor_sentence'])
         loaded_data_dict['validation']['case'].append(item['case'])
-
-    for item in test_data:
-        loaded_data_dict['test']['err_sentence'].append(item['err_sentence'])
-        loaded_data_dict['test']['cor_sentence'].append(item['cor_sentence'])
-        loaded_data_dict['test']['case'].append(item['case'])
 
     if os.path.exists(INCORRECT_CASES_FILE):
         with open(INCORRECT_CASES_FILE, 'r') as f:
@@ -261,11 +249,6 @@ def make_dataset(train_data_path_list, test_data_path_list):
             'cor_sentence': Value('string'),
             'case': Value('string')
         })),
-        'test': Dataset.from_dict(loaded_data_dict['test'], split='test', features=Features({
-            'err_sentence': Value('string'),
-            'cor_sentence': Value('string'),
-            'case': Value('string')
-        }))
     }
     return DatasetDict(dataset_dict)
 
@@ -310,7 +293,7 @@ def train(config):
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
     print(f'[{_now_time}] ====== Data Load Start ======')
-    dataset = make_dataset(config.train_data_path_list, config.test_data_path_list)
+    dataset = make_dataset(config.train_data_path_list, config.validation_data_path_list)
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Data Load Finished ======')
 
@@ -335,32 +318,34 @@ def train(config):
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=config.output_dir,
-        learning_rate=1e-5,
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
-        num_train_epochs=100,
-        gradient_accumulation_steps=2,
-        warmup_ratio=0.05,
-        fp16=True if torch.cuda.is_available() else False,
+        learning_rate=config.learning_rate,
+        per_device_train_batch_size=config.per_device_train_batch_size,
+        per_device_eval_batch_size=config.per_device_eval_batch_size,
+        num_train_epochs=config.num_train_epochs,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        warmup_ratio=config.warmup_ratio,
+        fp16=config.fp16,
         weight_decay=config.weight_decay,
         do_eval=config.do_eval,
-        evaluation_strategy="steps",
-        log_level="info",
+        evaluation_strategy=config.evaluation_strategy,
+        log_level=config.log_level,
         logging_dir=config.logging_dir,
-        logging_strategy="steps",
-        logging_steps=10,
-        eval_steps=10,
-        save_strategy="steps",
-        save_steps=10,
-        save_total_limit=1,
-        load_best_model_at_end=True,
-        dataloader_num_workers=0,
-        group_by_length=True,
-        report_to=None,
-        ddp_find_unused_parameters=False,
-        label_smoothing_factor=0.05,
+        logging_strategy=config.logging_strategy,
+        logging_steps=config.logging_steps,
+        eval_steps=config.eval_steps,
+        save_strategy=config.save_strategy,
+        save_steps=config.save_steps,
+        save_total_limit=config.save_total_limit,
+        load_best_model_at_end=config.load_best_model_at_end,
+        metric_for_best_model=config.metric_for_best_model,
+        greater_is_better=config.greater_is_better,
+        dataloader_num_workers=config.dataloader_num_workers,
+        group_by_length=config.group_by_length,
+        report_to=config.report_to,
+        ddp_find_unused_parameters=config.ddp_find_unused_parameters,
+        label_smoothing_factor=config.label_smoothing_factor,
         predict_with_generate=True,
-        generation_max_length=50,
+        generation_max_length=config.max_length,
     )
 
     trainer = CustomSeq2SeqTrainer(
@@ -373,7 +358,7 @@ def train(config):
         callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
         weights=weights,
         full_eval_dataset=full_eval_dataset,
-        candidate_file='../datasets/dataset_train_case3.json',
+        candidate_file=config.candidate_data_path_list[0],
         is_reinforce=False
     )
 
@@ -404,8 +389,8 @@ if __name__ == '__main__':
     print(f'TRAIN FILE PATH :')
     for _path in config.train_data_path_list:
         print(f' - {_path}')
-    print(f'TEST FILE PATH :')
-    for _path in config.test_data_path_list:
+    print(f'VALID FILE PATH :')
+    for _path in config.validation_data_path_list:
         print(f' - {_path}')
     print(f'SAVE PATH : {config.output_dir}')
     train(config)

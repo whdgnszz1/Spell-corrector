@@ -6,30 +6,29 @@ test_size: 0.05
 dataloader_num_workers: 0
 ddp_find_unused_parameters: False
 
-
 # hyperparameter
-learning_rate: 1e-4
-per_device_train_batch_size: 64
-per_device_eval_batch_size: 64
-num_train_epochs: 30
+learning_rate: 1e-5
+per_device_train_batch_size: 32
+per_device_eval_batch_size: 32
+num_train_epochs: 100
 fp16: False
 weight_decay: 0.01
 warmup_ratio: 0.05
-
+gradient_accumulation_steps: 2
+label_smoothing_factor: 0.05
 
 # logging and eval
 do_eval: True
 evaluation_strategy: "steps"
 log_level: "info"
 logging_strategy: "steps"
-logging_steps: 150
-eval_steps: 150
-save_strategy: "steps"
-
+logging_steps: 10
+eval_steps: 10
 
 # save strategy
-save_steps: 150
-save_total_limit: 5
+save_strategy: "steps"
+save_steps: 10
+save_total_limit: 1
 load_best_model_at_end: True
 metric_for_best_model: 'eval_loss'
 greater_is_better: True
@@ -43,15 +42,14 @@ report_to: 'none'
 pretrained_model_name: "gogamza/kobart-base-v2"
 
 # data
+candidate_data_path_list:
+  - "../datasets/dataset_candidate_case3.json"
 train_data_path_list:
-    - "../datasets/dataset_train_case3.json"
+  - "../datasets/dataset_train_case3.json"
 validation_data_path_list:
-    - "../datasets/dataset_train_case3.json"
-test_data_path_list:
-    - "../datasets/dataset_train_case3.json"
-
+  - "../datasets/dataset_val_case3.json"
 src_col: "err_sentence"
 tgt_col: "cor_sentence"
 prefix: "correction:"
-group_by_length: False
-max_length: 128
+group_by_length: True
+max_length: 50
