@@ -174,7 +174,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
             weights=weights,
             full_eval_dataset=self.full_eval_dataset,
-            candidate_file='../datasets/dataset_test_case3_1000.json',
+            candidate_file='../datasets/dataset_train_case3.json',
             is_reinforce=True
         )
         reinforced_trainer.train()
@@ -373,7 +373,7 @@ def train(config):
         callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
         weights=weights,
         full_eval_dataset=full_eval_dataset,
-        candidate_file='../datasets/dataset_test_case3_1000.json',
+        candidate_file='../datasets/dataset_train_case3.json',
         is_reinforce=False
     )
 
