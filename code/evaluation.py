@@ -8,185 +8,208 @@ import json
 from tqdm import tqdm
 from datetime import datetime
 import argparse
-import Levenshtein
 import random
+import re
+from Levenshtein import distance as levenshtein_distance
 
-def load_datasets(test_file, sample_size=100):
-    with open(test_file, 'r') as f:
-        json_dataset = json.load(f)
+
+def load_datasets(test_file, candidate_file='../datasets/dataset_candidate_case3.json'):
+    """
+    테스트 데이터셋과 후보군 데이터셋을 로드하는 함수
+    Args:
+        test_file (str): 테스트 데이터셋 파일 경로
+        candidate_file (str): 후보군 데이터셋 파일 경로 (기본값: ../datasets/dataset_candidate_case3.json)
+    Returns:
+        tuple: (DatasetDict, list) - 테스트 데이터셋과 후보군 리스트
+    """
+    # 테스트 데이터셋 로드
+    try:
+        with open(test_file, 'r') as f:
+            json_dataset = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Test file '{test_file}' not found.")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print(f"Error: Test file '{test_file}' is not a valid JSON.")
+        sys.exit(1)
 
     list_dataset = {
-        'id': [str(data['metadata_info']['id']) for data in json_dataset['data']],
-        'err_sentence': [data['annotation']['err_sentence'] for data in json_dataset['data']],
-        'cor_sentence': [data['annotation']['cor_sentence'] for data in json_dataset['data']]
+        'err_sentence': list(map(lambda x: str(x['annotation']['err_sentence']), json_dataset['data'])),
+        'cor_sentence': list(map(lambda x: str(x['annotation']['cor_sentence']), json_dataset['data']))
     }
+    dataset_dict = {'test': datasets.Dataset.from_dict(list_dataset, split='test')}
 
-    indices = random.sample(range(len(list_dataset['id'])), min(sample_size, len(list_dataset['id'])))
-    sampled_dataset = {
-        'id': [list_dataset['id'][i] for i in indices],
-        'err_sentence': [list_dataset['err_sentence'][i] for i in indices],
-        'cor_sentence': [list_dataset['cor_sentence'][i] for i in indices]
-    }
+    # 후보군 데이터셋 로드
+    try:
+        with open(candidate_file, 'r') as f:
+            candidate_data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Candidate file '{candidate_file}' not found.")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print(f"Error: Candidate file '{candidate_file}' is not a valid JSON.")
+        sys.exit(1)
 
-    dataset_dict = {
-        'test': datasets.Dataset.from_dict(
-            sampled_dataset,
-            features=datasets.Features({
-                'id': datasets.Value('string'),
-                'err_sentence': datasets.Value('string'),
-                'cor_sentence': datasets.Value('string')
-            }),
-            split='test'
-        )
-    }
-    return datasets.DatasetDict(dataset_dict)
+    candidates = list(map(lambda x: str(x['annotation']['cor_sentence']), candidate_data['data']))
+
+    return datasets.DatasetDict(dataset_dict), candidates
 
 
-def load_candidates(candidate_file):
-    with open(candidate_file, 'r') as f:
-        json_dataset = json.load(f)
-    candidates = [data['annotation']['cor_sentence'] for data in json_dataset['data']]
-    return candidates
+def get_ngram(text, n_gram):
+    ngram_list = []
+    text_length = len(text)
+    for i in range(text_length - n_gram + 1):
+        ngram_list.append(text[i:i + n_gram])
+    return ngram_list
 
 
-def calc_accuracy(cor_sentence, prd_sentence):
-    return 1.0 if prd_sentence == cor_sentence else 0.0
+def calc_f_05(cor_sentence, prd_sentence, n_gram):
+    prd_word_list = get_ngram(prd_sentence, n_gram)
+    cor_word_list = get_ngram(cor_sentence, n_gram)
+    if not cor_word_list:
+        return 0, 0, 0
+    cnt = 0
+    for idx in range(len(prd_word_list)):
+        start_idx = max(0, idx - 2)
+        end_idx = min(len(cor_word_list), idx + 3)
+        if prd_word_list[idx] in cor_word_list[start_idx:end_idx]:
+            cnt += 1
+    if not prd_word_list:
+        return 0, 0, 0
+    precision = cnt / len(prd_word_list)
+    recall = cnt / len(cor_word_list)
+    if (0.25 * precision + recall) == 0:
+        return 0, 0, 0
+    f_05 = 1.25 * (precision * recall) / (0.25 * precision + recall)
+    return precision, recall, f_05
 
 
-def calc_edit_distance(cor_sentence, prd_sentence):
-    return Levenshtein.distance(cor_sentence, prd_sentence)
+def post_process(raw_prediction, err_sentence):
+    cleaned = re.sub(r'(\b\w+\b)(\s+\1)+', r'\1', raw_prediction)
+    cleaned = re.sub(r'(.)\1+', r'\1', cleaned)
+    target_length = len(err_sentence)
+    if len(cleaned) > target_length * 1.5:
+        cleaned = cleaned[:target_length]
+    return cleaned.strip()
 
 
-def calc_char_accuracy(cor_sentence, prd_sentence):
-    if not cor_sentence:
-        return 0.0
-    matches = sum(1 for c1, c2 in zip(cor_sentence, prd_sentence) if c1 == c2)
-    return matches / len(cor_sentence)
+def find_closest_candidate(post_processed_prd, candidates):
+    """post_processed 결과와 후보군 중 편집 거리가 가장 짧은 값을 반환"""
+    min_distance = float('inf')
+    closest_candidate = None
+    for candidate in candidates:
+        dist = levenshtein_distance(post_processed_prd, candidate)
+        if dist < min_distance:
+            min_distance = dist
+            closest_candidate = candidate
+    return closest_candidate
 
 
-def remove_repetition(sentence):
-    words = sentence.split()
-    seen = set()
-    result = []
-    for word in words:
-        if word not in seen:
-            seen.add(word)
-            result.append(word)
-    return ' '.join(result)
-
-
-def find_closest_candidates(raw_prd_sentence, candidates, top_n=3):
-    distances = [(candidate, Levenshtein.distance(raw_prd_sentence, candidate)) for candidate in candidates]
-    sorted_distances = sorted(distances, key=lambda x: x[1])
-    return sorted_distances[:top_n]
-
-
-def my_train(gpus='cpu', model_path=None, test_file=None, save_path=None, pb=False):
+def my_train(gpus='cpu', model_path=None, test_file=None, eval_length=None, save_path=None, pb=False):
     model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    dataset = load_datasets(test_file, sample_size=100)
-    candidates = [data['cor_sentence'] for data in dataset['test']]
-
+    dataset, candidates = load_datasets(test_file)  # 수정된 함수 호출
+    if eval_length and eval_length < len(dataset['test']):
+        indices = random.sample(range(len(dataset['test'])), eval_length)
+        dataset['test'] = dataset['test'].select(indices)
+        data_len = eval_length
+    else:
+        data_len = len(dataset['test'])
     device = torch.device(gpus)
     model.to(device)
 
-    id_list, err_sentence_list, cor_sentence_list = [], [], []
-    prd_sentence_list, accuracy_list, edit_distance_list, char_accuracy_list = [], [], [], []
+    err_sentence_list = []
+    cor_sentence_list = []
+    raw_prd_sentence_list = []
+    post_processed_prd_sentence_list = []
+    final_prd_sentence_list = []
+    precision_list = []
+    recall_list = []
+    f_05_list = []
 
-    data_len = len(dataset['test'])
+    ngram = 2
+    bar_length = 100
 
-    print('=' * 100)
+    print('=' * bar_length)
     for n in tqdm(range(data_len), disable=pb):
-        data_id = dataset['test'][n]['id']
         err_sentence = dataset['test'][n]['err_sentence']
+        err_sentence_list.append(err_sentence)
         cor_sentence = dataset['test'][n]['cor_sentence']
-
+        cor_sentence_list.append(cor_sentence)
         tokenized = tokenizer(err_sentence, return_tensors='pt')
         input_ids = tokenized['input_ids'].to(device)
-
-        cor_length = len(tokenizer.tokenize(cor_sentence))
-        max_length = cor_length + 3
-        min_length = max(cor_length - 2, 1)
-
         res = model.generate(
             inputs=input_ids,
             num_beams=10,
             num_return_sequences=1,
-            temperature=1.0,
+            temperature=0.7,
             repetition_penalty=2.0,
-            length_penalty=0.8,
+            length_penalty=1.0,
             no_repeat_ngram_size=2,
-            max_length=max_length,
-            min_length=min_length,
-            early_stopping=True,
-            eos_token_id=tokenizer.eos_token_id,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95
-        ).cpu().tolist()
+            max_length=input_ids.size()[1] + 5
+        ).cpu().tolist()[0]
+        raw_prd_sentence = tokenizer.decode(res, skip_special_tokens=True).strip()
+        raw_prd_sentence_list.append(raw_prd_sentence)
+        post_processed_prd_sentence = post_process(raw_prd_sentence, err_sentence)
+        post_processed_prd_sentence_list.append(post_processed_prd_sentence)
 
-        raw_prd_sentence = tokenizer.decode(res[0], skip_special_tokens=True).strip()
-        prd_sentence = raw_prd_sentence
+        final_prd_sentence = find_closest_candidate(post_processed_prd_sentence, candidates)
+        final_prd_sentence_list.append(final_prd_sentence)
 
-        closest_candidates = find_closest_candidates(prd_sentence, candidates, top_n=3)
-        prd_sentence, edit_distance = closest_candidates[0]
-
-        accuracy = calc_accuracy(cor_sentence, prd_sentence)
-        char_accuracy = calc_char_accuracy(cor_sentence, prd_sentence)
-
-        id_list.append(data_id)
-        err_sentence_list.append(err_sentence)
-        cor_sentence_list.append(cor_sentence)
-        prd_sentence_list.append(prd_sentence)
-        accuracy_list.append(accuracy)
-        edit_distance_list.append(edit_distance)
-        char_accuracy_list.append(char_accuracy)
+        precision, recall, f_05 = calc_f_05(cor_sentence, final_prd_sentence, ngram)
+        precision_list.append(precision)
+        recall_list.append(recall)
+        f_05_list.append(f_05)
 
         _cnt = n + 1
         _per_calc = round(_cnt / data_len, 4)
         _now_time = datetime.now().__str__()
-        print(f'[{_now_time}] - [{_per_calc:6.1%} {_cnt:06,}/{data_len:06,}] - Evaluation Result (Data id : {data_id})')
-        print(f'{" " * 30} >       TEST : {err_sentence}')
-        print(f'{" " * 30} >    RAW PREDICT : {raw_prd_sentence}')
-        print(f'{" " * 30} >    PREDICT : {prd_sentence}')
-        print(f'{" " * 30} >      LABEL : {cor_sentence}')
-        print(f'{" " * 30} > ACCURACY : {accuracy:6.3f}')
-        print(f'{" " * 30} > EDIT DISTANCE : {edit_distance}')
-        print(f'{" " * 30} > CHAR ACCURACY : {char_accuracy:6.3f}')
-        print(f'{" " * 30} > TOP 3 CANDIDATES (w/ PREDICT):')
-        for i, (candidate, distance) in enumerate(closest_candidates, 1):
-            print(f'{" " * 30} >     {i}. {candidate} (편집 거리: {distance})')
-        print('=' * 100)
+        _blank = ' ' * 30
+        print(f'[{_now_time}] - [{_per_calc:6.1%} {_cnt:06,}/{data_len:06,}] - Evaluation Result')
+        print(f'{_blank} >       TEST : {err_sentence}')
+        print(f'{_blank} > RAW PREDICT : {raw_prd_sentence}')
+        print(f'{_blank} > POST PROCESSED : {post_processed_prd_sentence}')
+        print(f'{_blank} > FINAL PREDICT : {final_prd_sentence}')
+        print(f'{_blank} >      LABEL : {cor_sentence}')
+        print(f'{_blank} >  PRECISION : {precision:6.3f}')
+        print(f'{_blank} >     RECALL : {recall:6.3f}')
+        print(f'{_blank} > F0.5 SCORE : {f_05:6.3f}')
+        print('=' * bar_length)
 
+        torch.cuda.empty_cache()
+
+    _now_time = datetime.now().__str__()
     save_file_name = os.path.split(test_file)[-1].replace('.json', '') + '.csv'
     save_file_path = os.path.join(save_path, save_file_name)
-    df = pd.DataFrame({
-        'id': id_list,
+    _df = pd.DataFrame({
         'err_sentence': err_sentence_list,
-        'prd_sentence': prd_sentence_list,
+        'raw_prd_sentence': raw_prd_sentence_list,
+        'post_processed_prd_sentence': post_processed_prd_sentence_list,
+        'final_prd_sentence': final_prd_sentence_list,
         'cor_sentence': cor_sentence_list,
-        'accuracy': accuracy_list,
-        'edit_distance': edit_distance_list,
-        'char_accuracy': char_accuracy_list
+        'precision': precision_list,
+        'recall': recall_list,
+        'f_05': f_05_list
     })
-    df.to_csv(save_file_path, index=True)
-    print(f'[{datetime.now()}] - Save Result File(.csv) - {save_file_path}')
+    _df.to_csv(save_file_path, index=True)
+    print(f'[{_now_time}] - Save Result File(.csv) - {save_file_path}')
 
-    print('=' * 100)
-    mean_accuracy = sum(accuracy_list) / len(accuracy_list)
-    mean_edit_distance = sum(edit_distance_list) / len(edit_distance_list)
-    mean_char_accuracy = sum(char_accuracy_list) / len(char_accuracy_list)
-    print(f'       Average Accuracy : {mean_accuracy:6.3f}')
-    print(f'       Average Edit Distance : {mean_edit_distance:6.3f}')
-    print(f'       Average Char Accuracy : {mean_char_accuracy:6.3f}')
-    print('=' * 100)
+    mean_precision = sum(precision_list) / len(precision_list)
+    mean_recall = sum(recall_list) / len(recall_list)
+    mean_f_05 = sum(f_05_list) / len(f_05_list)
+    print(f'       Evaluation Ngram : {ngram}')
+    print(f'      Average Precision : {mean_precision:6.3f}')
+    print(f'         Average Recall : {mean_recall:6.3f}')
+    print(f'     Average F0.5 score : {mean_f_05:6.3f}')
+    print('=' * bar_length)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu_no", dest="gpu_no", type=int, action="store")
     parser.add_argument("--model_path", dest="model_path", type=str, action="store")
     parser.add_argument("--test_file", dest="test_file", type=str, action="store")
+    parser.add_argument("--eval_length", dest="eval_length", type=int, action="store")
     parser.add_argument("-pb", dest="pb", action="store_true")
     args = parser.parse_args(sys.argv[1:])
 
@@ -194,12 +217,19 @@ if __name__ == '__main__':
     os.makedirs(save_path, exist_ok=True)
 
     gpu_no = 'cpu'
-    if args.gpu_no is not None:
+    if args.gpu_no or args.gpu_no == 0:
         gpu_no = f'cuda:{args.gpu_no}'
 
-    pb = not args.pb
+    if args.pb:
+        args.pb = False
+    else:
+        args.pb = True
 
-    print(f'[{datetime.now()}] ========== Evaluation Start ==========')
-    print(f'DEVICE : {gpu_no}, MODEL PATH : {args.model_path}, FILE PATH : {args.test_file}, SAVE PATH : {save_path}')
-    my_train(gpu_no, model_path=args.model_path, test_file=args.test_file, save_path=save_path, pb=pb)
-    print(f'[{datetime.now()}] ========== Evaluation Finished ==========')
+    _now_time = datetime.now().__str__()
+    print(f'[{_now_time}] ========== Evaluation Start ==========')
+    print(
+        f'DEVICE : {gpu_no}, MODEL PATH : {args.model_path}, FILE PATH : {args.test_file}, DATA LENGTH : {args.eval_length}, SAVE PATH : {save_path}')
+    my_train(gpu_no, model_path=args.model_path, test_file=args.test_file, eval_length=args.eval_length,
+             save_path=save_path, pb=args.pb)
+    _now_time = datetime.now().__str__()
+    print(f'[{_now_time}] ========== Evaluation Finished ==========')

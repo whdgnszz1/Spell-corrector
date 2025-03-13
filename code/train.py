@@ -1,333 +1,226 @@
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, GenerationConfig
-from transformers import DataCollatorForSeq2Seq, get_linear_schedule_with_warmup
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer, EarlyStoppingCallback
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import datasets
+from transformers import DataCollatorForSeq2Seq
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import os
 import sys
 import json
 from datetime import datetime
 import argparse
 from omegaconf import OmegaConf
-from datasets import Dataset, DatasetDict, Features, Value
-import torch
-import torch.nn.functional as F
-from torch.utils.data import WeightedRandomSampler, DataLoader
-import Levenshtein
+import random
 
-INCORRECT_CASES_FILE = 'incorrect_cases.json'
+# 한글 분리 및 조합 함수
+def decompose_hangul(char):
+    if not (0xAC00 <= ord(char) <= 0xD7A3):
+        return char
+    code = ord(char) - 0xAC00
+    jongseong = code % 28
+    jungseong = ((code - jongseong) // 28) % 21
+    choseong = ((code - jongseong) // 28) // 21
+    return choseong, jungseong, jongseong
 
+def compose_hangul(choseong, jungseong, jongseong):
+    return chr(0xAC00 + (choseong * 21 + jungseong) * 28 + jongseong)
 
-def load_candidates(candidate_file):
-    with open(candidate_file, 'r', encoding='utf-8') as f:
-        json_dataset = json.load(f)
-    candidates = [data['annotation']['cor_sentence'] for data in json_dataset['data']]
-    return candidates
+# 인접 키 정의 (두벌식 자판 기준)
+choseong_adjacent = {
+    0: [1, 2, 6], 1: [0, 2], 2: [0, 1, 3], 3: [2, 4], 4: [3, 5],
+    5: [4, 6], 6: [0, 5, 7], 7: [6, 8], 8: [7, 9], 9: [8]
+}
+jungseong_adjacent = {
+    0: [1, 4], 1: [0, 2], 2: [1, 3], 3: [2], 4: [0, 5], 5: [4]
+}
 
+# 증강 함수
+def substitute(char, choseong_adjacent, jungseong_adjacent):
+    if not (0xAC00 <= ord(char) <= 0xD7A3):
+        return char
+    choseong, jungseong, jongseong = decompose_hangul(char)
+    choice = random.choice(['choseong', 'jungseong'])
+    if choice == 'choseong' and choseong in choseong_adjacent:
+        new_choseong = random.choice(choseong_adjacent[choseong])
+        return compose_hangul(new_choseong, jungseong, jongseong)
+    elif choice == 'jungseong' and jungseong in jungseong_adjacent:
+        new_jungseong = random.choice(jungseong_adjacent[jungseong])
+        return compose_hangul(choseong, new_jungseong, jongseong)
+    return char
 
-def remove_repetition(sentence):
-    words = sentence.split()
-    seen = set()
-    result = []
-    for word in words:
-        if word not in seen:
-            seen.add(word)
-            result.append(word)
-    return ' '.join(result)
+def augment_substitute(sentence, prob=0.1):
+    augmented = [substitute(char, choseong_adjacent, jungseong_adjacent)
+                 if random.random() < prob else char
+                 for char in sentence]
+    return ''.join(augmented)
 
+def augment_insert(sentence, prob=0.1):
+    augmented = []
+    for char in sentence:
+        augmented.append(char)
+        if random.random() < prob:
+            new_choseong = random.choice(list(choseong_adjacent.keys()))
+            new_jungseong = random.choice(list(jungseong_adjacent.keys()))
+            augmented.append(compose_hangul(new_choseong, new_jungseong, 0))
+    return ''.join(augmented)
 
-def find_closest_candidates(raw_prd_sentence, candidates, top_n=1):
-    distances = [(candidate, Levenshtein.distance(raw_prd_sentence, candidate)) for candidate in candidates]
-    sorted_distances = sorted(distances, key=lambda x: x[1])
-    return sorted_distances[:top_n]
+def augment_delete(sentence, prob=0.1):
+    if len(sentence) <= 1:
+        return sentence
+    augmented = [char for char in sentence if random.random() >= prob]
+    if not augmented:
+        augmented = [random.choice(sentence)]
+    return ''.join(augmented)
 
+def augment_transpose(sentence, prob=0.1):
+    if len(sentence) < 2:
+        return sentence
+    augmented = list(sentence)
+    for i in range(len(augmented) - 1):
+        if random.random() < prob:
+            augmented[i], augmented[i + 1] = augmented[i + 1], augmented[i]
+    return ''.join(augmented)
 
-class CustomSeq2SeqTrainer(Seq2SeqTrainer):
-    def __init__(self, *args, weights=None, full_eval_dataset=None, candidate_file=None, is_reinforce=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.full_eval_dataset = full_eval_dataset
-        self.candidates = load_candidates(candidate_file) if candidate_file else []
-        self.is_reinforce = is_reinforce
-        if weights is not None:
-            self.sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
-        else:
-            self.sampler = None
+def augment_sentence(sentence, prob=0.1):
+    methods = [augment_substitute, augment_insert, augment_delete, augment_transpose]
+    method = random.choice(methods)
+    return method(sentence, prob)
 
-    def get_train_dataloader(self):
-        if self.sampler is not None:
-            return DataLoader(
-                self.train_dataset,
-                batch_size=self.args.per_device_train_batch_size,
-                sampler=self.sampler,
-                collate_fn=self.data_collator
-            )
-        return super().get_train_dataloader()
+# n-gram 및 F0.5 계산 함수
+def get_ngram(text, n_gram):
+    ngram_list = []
+    text_length = len(text)
+    for i in range(text_length - n_gram + 1):
+        ngram_list.append(text[i:i + n_gram])
+    return ngram_list
 
-    def compute_loss(self, model, inputs, return_outputs=False):
-        labels = inputs.get("labels")
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
-        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100)
-        return (loss, outputs) if return_outputs else loss
+def calc_f_05(cor_sentence, prd_sentence, n_gram=2):
+    prd_word_list = get_ngram(prd_sentence, n_gram)
+    cor_word_list = get_ngram(cor_sentence, n_gram)
+    if not cor_word_list or not prd_word_list:
+        return 0, 0, 0
+    cnt = 0
+    for idx in range(len(prd_word_list)):
+        start_idx = max(0, idx - 2)
+        end_idx = min(len(cor_word_list), idx + 3)
+        if prd_word_list[idx] in cor_word_list[start_idx:end_idx]:
+            cnt += 1
+    precision = cnt / len(prd_word_list) if prd_word_list else 0
+    recall = cnt / len(cor_word_list) if cor_word_list else 0
+    if precision + recall == 0:
+        f_05 = 0
+    else:
+        f_05 = 1.25 * (precision * recall) / (0.25 * precision + recall)
+    return precision, recall, f_05
 
-    def create_optimizer(self):
-        return torch.optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
-
-    def create_optimizer_and_scheduler(self, num_training_steps: int):
-        self.optimizer = self.create_optimizer()
-        num_warmup_steps = int(self.args.warmup_ratio * num_training_steps)
-        self.lr_scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
-        )
-        return self.optimizer, self.lr_scheduler
-
-    def evaluate(self, *args, **kwargs):
-        eval_result = super().evaluate(*args, **kwargs)
-        model = self.model
-        model.eval()
-        predictions = []
-        for batch in self.get_eval_dataloader():
-            inputs = {k: v.to(self.args.device) for k, v in batch.items() if k != 'labels'}
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_length=50,
-                    num_beams=4,
-                    bos_token_id=0,
-                    eos_token_id=1,
-                    pad_token_id=3,
-                    decoder_start_token_id=1,
-                    forced_eos_token_id=1
-                )
-            predictions.extend(generated_ids.cpu().tolist())
-
-        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        labels = self.eval_dataset['labels']
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        incorrect_cases = []
-        for i, (raw_pred, label) in enumerate(zip(decoded_preds, decoded_labels)):
-            prd_sentence = remove_repetition(raw_pred)
-            cor_word_count = len(label.split())
-            prd_words = prd_sentence.split()
-            prd_sentence = ' '.join(prd_words[:cor_word_count])
-            closest_candidates = find_closest_candidates(prd_sentence, self.candidates, top_n=1)
-            prd_sentence, _ = closest_candidates[0]
-            edit_distance = Levenshtein.distance(prd_sentence, label)
-            if edit_distance > 2:
-                incorrect_cases.append({
-                    'err_sentence': self.full_eval_dataset[i]['err_sentence'],
-                    'cor_sentence': label,
-                    'case': self.full_eval_dataset[i]['case'],
-                    'edit_distance': edit_distance
-                })
-
-        if incorrect_cases:
-            with open(INCORRECT_CASES_FILE, 'w') as f:
-                json.dump(incorrect_cases, f, ensure_ascii=False, indent=4)
-            print(f"Saved {len(incorrect_cases)} incorrect cases with edit distance > 2 to {INCORRECT_CASES_FILE}")
-
-        return eval_result
-
-    def train(self, resume_from_checkpoint=None, **kwargs):
-        super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
-        if not self.is_reinforce:
-            incorrect_cases = self.collect_incorrect_cases()
-            if incorrect_cases:
-                print(
-                    f"Starting reinforcement learning for {len(incorrect_cases)} incorrect cases with edit distance > 2.")
-                self.reinforce_learning(incorrect_cases)
-
-    def collect_incorrect_cases(self):
-        if os.path.exists(INCORRECT_CASES_FILE):
-            with open(INCORRECT_CASES_FILE, 'r') as f:
-                incorrect_cases = json.load(f)
-            return incorrect_cases
-        return []
-
-    def reinforce_learning(self, incorrect_cases):
-        reinforced_dataset = {
-            'err_sentence': [case['err_sentence'] for case in incorrect_cases],
-            'cor_sentence': [case['cor_sentence'] for case in incorrect_cases],
-            'case': [case['case'] for case in incorrect_cases],
-            'weight': [case['edit_distance'] for case in incorrect_cases]
-        }
-        reinforced_dataset = Dataset.from_dict(reinforced_dataset)
-        reinforced_dataset_tokenized = reinforced_dataset.map(
-            lambda d: preprocess_function(d, self.tokenizer, 'err_sentence', 'cor_sentence',
-                                          self.args.generation_max_length),
-            batched=True,
-            batch_size=self.args.per_device_train_batch_size
-        )
-        weights = reinforced_dataset_tokenized['weight']
-        train_dataset_processed = reinforced_dataset_tokenized.remove_columns(
-            ['err_sentence', 'cor_sentence', 'case', 'weight']
-        )
-        reinforced_trainer = CustomSeq2SeqTrainer(
-            model=self.model,
-            args=self.args,
-            train_dataset=train_dataset_processed,
-            eval_dataset=self.eval_dataset,
-            tokenizer=self.tokenizer,
-            data_collator=self.data_collator,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
-            weights=weights,
-            full_eval_dataset=self.full_eval_dataset,
-            candidate_file=config.candidate_data_path_list[0],
-            is_reinforce=True
-        )
-        reinforced_trainer.train()
-
-
-def make_dataset(train_data_path_list, validation_data_path_list):
+# 데이터셋 생성 함수 (정확한 문장 추가 및 augment_prob 조정)
+def make_dataset(train_data_path_list, validation_data_path_list, augment_prob=0.3):
     loaded_data_dict = {
-        'train': {'err_sentence': [], 'cor_sentence': [], 'case': [], 'score': [], 'weight': []},
-        'validation': {'err_sentence': [], 'cor_sentence': [], 'case': []},
+        'train': {'err_sentence': [], 'cor_sentence': []},
+        'validation': {'err_sentence': [], 'cor_sentence': []}
     }
-
+    # train 데이터 로드
     for i, train_data_path in enumerate(train_data_path_list):
         with open(train_data_path, 'r') as f:
             _temp_json = json.load(f)
-        for x in _temp_json['data']:
-            err = x['annotation'].get('err_sentence', '')
-            cor = x['annotation'].get('cor_sentence', '')
-            case = str(x['annotation'].get('case', ''))
-            if err and cor and case in ['1', '2', '3']:
-                loaded_data_dict['train']['err_sentence'].append(err)
-                loaded_data_dict['train']['cor_sentence'].append(cor)
-                loaded_data_dict['train']['case'].append(case)
-                loaded_data_dict['train']['score'].append(1.0)
-                loaded_data_dict['train']['weight'].append(1.0)
+        loaded_data_dict['train']['err_sentence'].extend(
+            list(map(lambda x: str(x['annotation']['err_sentence']), _temp_json['data'])))
+        loaded_data_dict['train']['cor_sentence'].extend(
+            list(map(lambda x: str(x['annotation']['cor_sentence']), _temp_json['data'])))
         print(f'train data {i} :', len(_temp_json['data']))
 
-    validation_data = []
+    # 원본 cor_sentence 저장
+    original_cor_sentences = loaded_data_dict['train']['cor_sentence'].copy()
+
+    # train 데이터 증강
+    augmented_train = {'err_sentence': [], 'cor_sentence': []}
+    for cor in original_cor_sentences:
+        err = augment_sentence(cor, prob=augment_prob)
+        augmented_train['err_sentence'].append(err)
+        augmented_train['cor_sentence'].append(cor)
+    loaded_data_dict['train']['err_sentence'].extend(augmented_train['err_sentence'])
+    loaded_data_dict['train']['cor_sentence'].extend(augmented_train['cor_sentence'])
+
+    # 정확한 문장 추가 (원본 데이터의 10%)
+    num_original = len(original_cor_sentences)
+    num_to_add = int(num_original * 0.1)
+    indices = random.sample(range(num_original), num_to_add)
+    for idx in indices:
+        cor = original_cor_sentences[idx]
+        loaded_data_dict['train']['err_sentence'].append(cor)
+        loaded_data_dict['train']['cor_sentence'].append(cor)
+
+    # validation 데이터 로드
     for i, validation_data_path in enumerate(validation_data_path_list):
         with open(validation_data_path, 'r') as f:
             _temp_json = json.load(f)
-        for x in _temp_json['data']:
-            err = x['annotation'].get('err_sentence', '')
-            cor = x['annotation'].get('cor_sentence', '')
-            case = str(x['annotation'].get('case', ''))
-            if err and cor and case in ['1', '2', '3']:
-                validation_data.append({
-                    'err_sentence': err,
-                    'cor_sentence': cor,
-                    'case': case
-                })
+        loaded_data_dict['validation']['err_sentence'].extend(
+            list(map(lambda x: str(x['annotation']['err_sentence']), _temp_json['data'])))
+        loaded_data_dict['validation']['cor_sentence'].extend(
+            list(map(lambda x: str(x['annotation']['cor_sentence']), _temp_json['data'])))
         print(f'validation data {i} :', len(_temp_json['data']))
 
-    for item in validation_data:
-        loaded_data_dict['validation']['err_sentence'].append(item['err_sentence'])
-        loaded_data_dict['validation']['cor_sentence'].append(item['cor_sentence'])
-        loaded_data_dict['validation']['case'].append(item['case'])
+    dataset_dict = {}
+    for _trg in loaded_data_dict.keys():
+        dataset_dict[_trg] = datasets.Dataset.from_dict(loaded_data_dict[_trg], split=_trg)
+    dataset = datasets.DatasetDict(dataset_dict)
+    return dataset
 
-    if os.path.exists(INCORRECT_CASES_FILE):
-        with open(INCORRECT_CASES_FILE, 'r') as f:
-            incorrect_cases = json.load(f)
-        incorrect_set = set((case['err_sentence'], case['cor_sentence'], case['case']) for case in incorrect_cases)
-        for i, (err, cor, case) in enumerate(zip(
-                loaded_data_dict['train']['err_sentence'],
-                loaded_data_dict['train']['cor_sentence'],
-                loaded_data_dict['train']['case']
-        )):
-            if (err, cor, case) in incorrect_set:
-                loaded_data_dict['train']['weight'][i] = 2.0
-        print(f"Assigned weights to {len(incorrect_cases)} incorrect cases in training data.")
-
-    features = Features({
-        'err_sentence': Value('string'),
-        'cor_sentence': Value('string'),
-        'case': Value('string'),
-        'score': Value('float32'),
-        'weight': Value('float32')
-    })
-
-    dataset_dict = {
-        'train': Dataset.from_dict(loaded_data_dict['train'], split='train', features=features),
-        'validation': Dataset.from_dict(loaded_data_dict['validation'], split='validation', features=Features({
-            'err_sentence': Value('string'),
-            'cor_sentence': Value('string'),
-            'case': Value('string')
-        })),
-    }
-    return DatasetDict(dataset_dict)
-
-
+# 전처리 함수
 def preprocess_function(df, tokenizer, src_col, tgt_col, max_length):
-    case_map = {
-        '1': '[KOR_TO_ENG]',
-        '2': '[ENG_TO_KOR]',
-        '3': '[TYPO]'
-    }
-    inputs = [f"{case_map.get(case, '[UNKNOWN]')} {err}" for case, err in zip(df['case'], df[src_col])]
+    inputs = df[src_col]
     targets = df[tgt_col]
-    tokenized = tokenizer(inputs, text_target=targets, max_length=max_length, truncation=True)
-    model_inputs = {
-        'input_ids': tokenized['input_ids'],
-        'attention_mask': tokenized['attention_mask'],
-        'labels': tokenized['labels']
-    }
+    model_inputs = tokenizer(inputs, max_length=max_length, truncation=True)
+    with tokenizer.as_target_tokenizer():
+        labels = tokenizer(targets, max_length=max_length, truncation=True)
+    model_inputs["labels"] = labels['input_ids']
     return model_inputs
 
-
+# 학습 함수 (compute_metrics 추가 및 파라미터 조정)
 def train(config):
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Model Load Start ======')
-    global tokenizer
-    model = AutoModelForSeq2SeqLM.from_pretrained(config.pretrained_model_name).to(
-        "cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForSeq2SeqLM.from_pretrained(config.pretrained_model_name)
     tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model_name)
-    tokenizer.add_special_tokens({'additional_special_tokens': ['[KOR_TO_ENG]', '[ENG_TO_KOR]', '[TYPO]']})
-    model.resize_token_embeddings(len(tokenizer))
-
-    model.generation_config = GenerationConfig(
-        bos_token_id=0,
-        eos_token_id=1,
-        pad_token_id=3,
-        decoder_start_token_id=1,
-        forced_eos_token_id=1
-    )
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Model Load Finished ======')
+
+    # F0.5 점수를 계산하는 compute_metrics 함수 정의
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        labels = [[token if token != -100 else tokenizer.pad_token_id for token in label] for label in labels]
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        f_05_list = []
+        for pred, label in zip(decoded_preds, decoded_labels):
+            _, _, f_05 = calc_f_05(label, pred, n_gram=2)
+            f_05_list.append(f_05)
+        return {"f_05": sum(f_05_list) / len(f_05_list)}
 
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
     print(f'[{_now_time}] ====== Data Load Start ======')
-    dataset = make_dataset(config.train_data_path_list, config.validation_data_path_list)
+    dataset = make_dataset(config.train_data_path_list, config.validation_data_path_list, augment_prob=0.3)
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Data Load Finished ======')
 
     print(f'[{_now_time}] ====== Data Preprocessing Start ======')
     dataset_tokenized = dataset.map(
         lambda d: preprocess_function(d, tokenizer, config.src_col, config.tgt_col, config.max_length),
-        batched=True,
-        batch_size=config.per_device_train_batch_size
-    )
-
-    weights = dataset_tokenized['train']['weight']
-    train_dataset_processed = dataset_tokenized['train'].remove_columns(
-        ['err_sentence', 'cor_sentence', 'case', 'score', 'weight']
-    )
-    eval_dataset_processed = dataset_tokenized['validation'].remove_columns(
-        ['err_sentence', 'cor_sentence', 'case']
-    )
-    full_eval_dataset = dataset_tokenized['validation']
-
+        batched=True, batch_size=config.per_device_train_batch_size)
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Data Preprocessing Finished ======')
 
+    # 훈련 인자 설정 (생성 파라미터 및 F0.5 기반 모델 선택 추가)
     training_args = Seq2SeqTrainingArguments(
         output_dir=config.output_dir,
         learning_rate=config.learning_rate,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         num_train_epochs=config.num_train_epochs,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        warmup_ratio=config.warmup_ratio,
         fp16=config.fp16,
-        weight_decay=config.weight_decay,
+        weight_decay=0.1,  # 정규화 강화
         do_eval=config.do_eval,
         evaluation_strategy=config.evaluation_strategy,
+        warmup_ratio=config.warmup_ratio,
         log_level=config.log_level,
         logging_dir=config.logging_dir,
         logging_strategy=config.logging_strategy,
@@ -337,63 +230,48 @@ def train(config):
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
         load_best_model_at_end=config.load_best_model_at_end,
-        metric_for_best_model=config.metric_for_best_model,
-        greater_is_better=config.greater_is_better,
+        metric_for_best_model="f_05",  # F0.5 점수로 최적 모델 선택
+        greater_is_better=True,
         dataloader_num_workers=config.dataloader_num_workers,
         group_by_length=config.group_by_length,
         report_to=config.report_to,
         ddp_find_unused_parameters=config.ddp_find_unused_parameters,
-        label_smoothing_factor=config.label_smoothing_factor,
-        predict_with_generate=True,
-        generation_max_length=config.max_length,
+        predict_with_generate=True,  # 생성 기반 평가
+        generation_num_beams=5,  # 빔 서치 활용
     )
 
-    trainer = CustomSeq2SeqTrainer(
+    trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset_processed,
-        eval_dataset=eval_dataset_processed,
+        train_dataset=dataset_tokenized['train'],
+        eval_dataset=dataset_tokenized['validation'],
         tokenizer=tokenizer,
         data_collator=data_collator,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
-        weights=weights,
-        full_eval_dataset=full_eval_dataset,
-        candidate_file=config.candidate_data_path_list[0],
-        is_reinforce=False
+        compute_metrics=compute_metrics,
     )
 
     trainer.train()
-    trainer.save_model(config.output_dir)
-    tokenizer.save_pretrained(config.output_dir)
-    print(f"Final model saved to {config.output_dir}")
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config-file')
     args = parser.parse_args(sys.argv[1:])
-
-    config_file = args.config_file
-    config = OmegaConf.load(config_file)
-
+    config = OmegaConf.load(args.config_file)
     save_path = './data/results'
     os.makedirs(save_path, exist_ok=True)
-
+    os.environ["CUDA_VISIBLE_DEVICES"] = config.CUDA_VISIBLE_DEVICES
     os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ========== Train Start ==========')
-
-    print(f'DEVICE : {"cuda" if torch.cuda.is_available() else "cpu"}')
+    print(f'DEVICE : {config.CUDA_VISIBLE_DEVICES}')
     print(f'MODEL NAME : {config.pretrained_model_name}')
     print(f'TRAIN FILE PATH :')
     for _path in config.train_data_path_list:
         print(f' - {_path}')
-    print(f'VALID FILE PATH :')
+    print(f'VALIDATION FILE PATH :')
     for _path in config.validation_data_path_list:
         print(f' - {_path}')
     print(f'SAVE PATH : {config.output_dir}')
     train(config)
-
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ========== Train Finished ==========')
