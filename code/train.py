@@ -9,109 +9,10 @@ from datetime import datetime
 import argparse
 from omegaconf import OmegaConf
 import random
+from utils import calc_f_05, augment_sentence
 
-# 한글 분리 및 조합 함수
-def decompose_hangul(char):
-    if not (0xAC00 <= ord(char) <= 0xD7A3):
-        return char
-    code = ord(char) - 0xAC00
-    jongseong = code % 28
-    jungseong = ((code - jongseong) // 28) % 21
-    choseong = ((code - jongseong) // 28) // 21
-    return choseong, jungseong, jongseong
 
-def compose_hangul(choseong, jungseong, jongseong):
-    return chr(0xAC00 + (choseong * 21 + jungseong) * 28 + jongseong)
-
-# 인접 키 정의 (두벌식 자판 기준)
-choseong_adjacent = {
-    0: [1, 2, 6], 1: [0, 2], 2: [0, 1, 3], 3: [2, 4], 4: [3, 5],
-    5: [4, 6], 6: [0, 5, 7], 7: [6, 8], 8: [7, 9], 9: [8]
-}
-jungseong_adjacent = {
-    0: [1, 4], 1: [0, 2], 2: [1, 3], 3: [2], 4: [0, 5], 5: [4]
-}
-
-# 증강 함수
-def substitute(char, choseong_adjacent, jungseong_adjacent):
-    if not (0xAC00 <= ord(char) <= 0xD7A3):
-        return char
-    choseong, jungseong, jongseong = decompose_hangul(char)
-    choice = random.choice(['choseong', 'jungseong'])
-    if choice == 'choseong' and choseong in choseong_adjacent:
-        new_choseong = random.choice(choseong_adjacent[choseong])
-        return compose_hangul(new_choseong, jungseong, jongseong)
-    elif choice == 'jungseong' and jungseong in jungseong_adjacent:
-        new_jungseong = random.choice(jungseong_adjacent[jungseong])
-        return compose_hangul(choseong, new_jungseong, jongseong)
-    return char
-
-def augment_substitute(sentence, prob=0.1):
-    augmented = [substitute(char, choseong_adjacent, jungseong_adjacent)
-                 if random.random() < prob else char
-                 for char in sentence]
-    return ''.join(augmented)
-
-def augment_insert(sentence, prob=0.1):
-    augmented = []
-    for char in sentence:
-        augmented.append(char)
-        if random.random() < prob:
-            new_choseong = random.choice(list(choseong_adjacent.keys()))
-            new_jungseong = random.choice(list(jungseong_adjacent.keys()))
-            augmented.append(compose_hangul(new_choseong, new_jungseong, 0))
-    return ''.join(augmented)
-
-def augment_delete(sentence, prob=0.1):
-    if len(sentence) <= 1:
-        return sentence
-    augmented = [char for char in sentence if random.random() >= prob]
-    if not augmented:
-        augmented = [random.choice(sentence)]
-    return ''.join(augmented)
-
-def augment_transpose(sentence, prob=0.1):
-    if len(sentence) < 2:
-        return sentence
-    augmented = list(sentence)
-    for i in range(len(augmented) - 1):
-        if random.random() < prob:
-            augmented[i], augmented[i + 1] = augmented[i + 1], augmented[i]
-    return ''.join(augmented)
-
-def augment_sentence(sentence, prob=0.1):
-    methods = [augment_substitute, augment_insert, augment_delete, augment_transpose]
-    method = random.choice(methods)
-    return method(sentence, prob)
-
-# n-gram 및 F0.5 계산 함수
-def get_ngram(text, n_gram):
-    ngram_list = []
-    text_length = len(text)
-    for i in range(text_length - n_gram + 1):
-        ngram_list.append(text[i:i + n_gram])
-    return ngram_list
-
-def calc_f_05(cor_sentence, prd_sentence, n_gram=2):
-    prd_word_list = get_ngram(prd_sentence, n_gram)
-    cor_word_list = get_ngram(cor_sentence, n_gram)
-    if not cor_word_list or not prd_word_list:
-        return 0, 0, 0
-    cnt = 0
-    for idx in range(len(prd_word_list)):
-        start_idx = max(0, idx - 2)
-        end_idx = min(len(cor_word_list), idx + 3)
-        if prd_word_list[idx] in cor_word_list[start_idx:end_idx]:
-            cnt += 1
-    precision = cnt / len(prd_word_list) if prd_word_list else 0
-    recall = cnt / len(cor_word_list) if cor_word_list else 0
-    if precision + recall == 0:
-        f_05 = 0
-    else:
-        f_05 = 1.25 * (precision * recall) / (0.25 * precision + recall)
-    return precision, recall, f_05
-
-# 데이터셋 생성 함수 (정확한 문장 추가 및 augment_prob 조정)
+# 데이터셋 생성 함수
 def make_dataset(train_data_path_list, validation_data_path_list, augment_prob=0.3):
     loaded_data_dict = {
         'train': {'err_sentence': [], 'cor_sentence': []},
@@ -164,6 +65,7 @@ def make_dataset(train_data_path_list, validation_data_path_list, augment_prob=0
     dataset = datasets.DatasetDict(dataset_dict)
     return dataset
 
+
 # 전처리 함수
 def preprocess_function(df, tokenizer, src_col, tgt_col, max_length):
     inputs = df[src_col]
@@ -174,7 +76,8 @@ def preprocess_function(df, tokenizer, src_col, tgt_col, max_length):
     model_inputs["labels"] = labels['input_ids']
     return model_inputs
 
-# 학습 함수 (compute_metrics 추가 및 파라미터 조정)
+
+# 학습 함수
 def train(config):
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Model Load Start ======')
@@ -183,7 +86,7 @@ def train(config):
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Model Load Finished ======')
 
-    # F0.5 점수를 계산하는 compute_metrics 함수 정의
+    # F0.5 점수를 계산하는 compute_metrics 함수
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
         decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
@@ -209,7 +112,7 @@ def train(config):
     _now_time = datetime.now().__str__()
     print(f'[{_now_time}] ====== Data Preprocessing Finished ======')
 
-    # 훈련 인자 설정 (생성 파라미터 및 F0.5 기반 모델 선택 추가)
+    # 훈련 인자 설정
     training_args = Seq2SeqTrainingArguments(
         output_dir=config.output_dir,
         learning_rate=config.learning_rate,
@@ -217,7 +120,7 @@ def train(config):
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         num_train_epochs=config.num_train_epochs,
         fp16=config.fp16,
-        weight_decay=0.1,  # 정규화 강화
+        weight_decay=0.1,
         do_eval=config.do_eval,
         evaluation_strategy=config.evaluation_strategy,
         warmup_ratio=config.warmup_ratio,
@@ -230,14 +133,14 @@ def train(config):
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
         load_best_model_at_end=config.load_best_model_at_end,
-        metric_for_best_model="f_05",  # F0.5 점수로 최적 모델 선택
+        metric_for_best_model="f_05",
         greater_is_better=True,
         dataloader_num_workers=config.dataloader_num_workers,
         group_by_length=config.group_by_length,
         report_to=config.report_to,
         ddp_find_unused_parameters=config.ddp_find_unused_parameters,
-        predict_with_generate=True,  # 생성 기반 평가
-        generation_num_beams=5,  # 빔 서치 활용
+        predict_with_generate=True,
+        generation_num_beams=5,
     )
 
     trainer = Seq2SeqTrainer(
@@ -251,6 +154,7 @@ def train(config):
     )
 
     trainer.train()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
